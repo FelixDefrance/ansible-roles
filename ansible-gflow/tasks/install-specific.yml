@@ -1,0 +1,11 @@
+---
+- name: Push gflow host specific configuration
+  become: yes
+  tags: gflow
+  template:
+      src: gflow-{{ansible_hostname}}.ini.j2
+      dest: /etc/gflow.ini
+      mode: 0644
+      owner: root
+      group: root
+      backup: yes

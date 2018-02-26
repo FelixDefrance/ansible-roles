@@ -1,0 +1,701 @@
+#! /usr/bin/env python
+#
+# Gateway FaiL Over Wan (formely known as Dead Gateway Detection)
+# Copyright (c) 2009 Julien Danjou <jdanjou@easter-eggs.com>
+# Copyright (c) 2013 Cyril Lacoux <clacoux@easter-eggs.com>
+#
+
+from ConfigParser import ConfigParser
+import json
+import logging
+from logging.config import fileConfig
+from optparse import OptionParser
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+
+
+# Global variables
+gateways = None
+log = None
+options = None
+
+
+#
+# Logging helpers
+#
+
+logging.EXCEPTION = 60
+logging.addLevelName(logging.EXCEPTION, 'EXCEPTION')
+
+class ExceptionFilter(logging.Filter):
+    """
+    Logging filter that increase log level to extra level EXCEPTION when logging an exception
+    This is very usefull when you want to log *only* exceptions on a specific handler
+    """
+
+    def filter(self, record):
+        if record.exc_info is not None:
+            # Increase level to EXCEPTION
+            record.levelno = logging.EXCEPTION
+            record.levelname = logging.getLevelName(record.levelno)
+        return True
+
+
+#
+# Cache management
+#
+
+
+def cache_load(filepath):
+    global gateways, log
+
+    try:
+        with open(filepath, 'r') as f:
+            gateways = json.load(f)
+
+    except Exception, e:
+        if hasattr(e, 'errno') and e.errno == 2:
+            # No such file or directory
+            gateways = []
+            return True
+
+        log.exception('Failed to open cache file {0}'.format(filepath))
+        return False
+
+    return True
+
+
+def cache_save(filepath):
+    global gateways, log
+
+    try:
+        with open(filepath, 'w') as f:
+            json.dump(gateways, f, indent=2)
+
+        os.chmod(filepath, stat.S_IRUSR | stat.S_IWUSR)
+
+    except:
+        log.exception('Failed to save cache file {0}'.format(filepath))
+        return False
+
+    return True
+
+
+def check_address(address):
+    """
+    Check an IP address using the fping command
+
+    @param string address, the address to check
+
+    @return boolean result, True if the address is alive, False otherwise
+    """
+    global options
+
+    (result, stdout, stderr) = run_command('{0} {1}'.format(options.fping, address), force=True)
+    return result
+
+
+def check_gateway(gateway):
+    """
+    Check if a gateway is alive
+    This means that count of alived gateway and remotes is at least equal to score.
+
+    @param dict gateway, the gateway to check
+
+    @return boolean result, True if gateway is alive, False otherwise
+    """
+    global log, options
+
+    if 'address' not in gateway:
+        gateway['is_alive'] = False
+        return False
+
+    gateway['passed'] = 0
+    if not gateway['reachable'] or check_address(gateway['address']):
+        # Gateway is alive
+        log.debug(' address {0} is alive'.format(gateway['address']))
+        gateway['passed'] += 1
+        if gateway['remotes']:
+            # Testing remotes
+            for remote in gateway['remotes']:
+                if route_add('{0}/32'.format(remote), gateway['address']):
+                    if check_address(remote):
+                        # Remote is alive
+                        log.debug(' address {0} is alive'.format(remote))
+                        gateway['passed'] += 1
+                    else:
+                        log.warning(' address {0} is unreachable'.format(remote))
+                    route_del('{0}/32'.format(remote), gateway['address'])
+                else:
+                    log.warning(' failed to add route for {0} via {1}'.format(remote, gateway['address']))
+
+    previous_status = gateway.get('is_alive', False)
+    if gateway['passed'] >= gateway['score']:
+        # Alive
+        log.debug('Gateway {address} is alive ({passed}/{total}, needed {score})'.format(**gateway))
+        gateway['is_alive'] = True
+        if not previous_status:
+            run_hook(gateway, 'change')
+            run_hook(gateway, 'up')
+    else:
+        # Dead
+        log.error('Gateway {address} is dead ({passed}/{total}, needed={score})'.format(**gateway))
+        gateway['is_alive'] = False
+        if previous_status:
+            run_hook(gateway, 'change')
+            run_hook(gateway, 'down')
+
+    return gateway['is_alive']
+
+
+def load_active_prefixes(gateway):
+    """
+    Load gateway's active prefixes from routing table
+
+    @param dict gateway, the gateway to get prefixes from
+
+    @return boolean result, True is gateway is active (ie, a default route is set), False otherwise
+    """
+    global options
+
+    gateway['active_prefixes'] = []
+
+    if 'address' not in gateway:
+        if 'prefixes' not in gateway:
+            gateway['prefixes'] = []
+        gateway['is_active'] = False
+        return False
+
+    (result, stdout, stderr) = run_command('{0} route show via {1} scope global'.format(options.ip, gateway['address']), force=True)
+    if result:
+        for m in re.finditer('(?P<prefix>.+)\s+dev\s+(?P<iface>\w+\d+)', stdout):
+            if 'iface' not in gateway:
+                gateway['iface'] = m.group('iface')
+            prefix = m.group('prefix')
+            if prefix == 'default':
+                continue
+            gateway['active_prefixes'].append(prefix)
+
+        gateway['active_prefixes'].sort()
+
+        if options.scan == 'all' or options.scan == gateway['address'] or 'prefixes' not in gateway:
+            gateway['prefixes'] = gateway['active_prefixes']
+
+        gateway['is_active'] = gateway['prefixes'] == gateway['active_prefixes']
+
+        return gateway['is_active']
+
+    return False
+
+
+def load_default_routes():
+    """
+    Load current default routes from routing table
+
+    @return int count, the number of default routes
+    """
+    global gateways, options
+
+    count = 0
+
+    (result, stdout, stderr) = run_command('{0} route show 0.0.0.0/0'.format(options.ip), force=True)
+    if result:
+        # Get active default routes for "normal" interfaces
+        addresses = [gateway.get('address') for gateway in gateways]
+        for m in re.finditer('default\s+via\s+(?P<address>[\d\.]+)\s+dev\s+(?P<iface>\w+\d+)', stdout):
+            address = m.group('address')
+            if address in addresses:
+                gateway = gateways[addresses.index(address)]
+                gateway['is_default'] = True
+                count += 1
+
+        # Get active default routes for ptp interfaces
+        ifaces = [gateway.get('iface') for gateway in gateways]
+        for m in re.finditer('default\s+dev\s+(?P<iface>\w+\d+)', stdout):
+            iface = m.group('iface')
+            if iface in ifaces:
+                gateway = gateways[ifaces.index(iface)]
+                gateway['is_default'] = True
+                count += 1
+
+    return count
+
+
+def load_peer(gateway):
+    """
+    Load peer for ptp connections
+
+    @param dict gateway, the gateway we want to get peer
+
+    @return boolean result, True if success, False otherwise
+    """
+
+    global options
+
+    if 'address' in gateway:
+        del gateway['address']
+
+    (result, stdout, stderr) = run_command('{0} route show dev {1} scope link'.format(options.ip, gateway['iface']), force=True)
+    m = re.match('(?P<address>.+)\s+ proto kernel\s+src\s+(?P<local>.+)', stdout)
+    if m:
+        gateway['address'] = m.group('address')
+        return True
+
+    return False
+
+
+#
+# Routes management
+#
+
+
+def route_add(dst, via, flush=False):
+    """
+    Add a route to routing table
+
+    @param string dst, destination
+    @param string via, gateway to use to reach destination
+    @param boolean flush, wether to flush the routing cache or not
+
+    @return boolean result, True on success, False otherwise
+    """
+    global options
+
+    (result, stdout, stderr) = run_command('{0} route add {1} nexthop via {2}'.format(options.ip, dst, via))
+    if result and flush:
+        return route_flush()
+    return result
+
+
+def route_change(dst, via, flush=False):
+    """
+    Change a route in routing table
+
+    @param string dst, destination
+    @param string via, gateway to use to reach destination
+    @param boolean flush, wether to flush the routing cache or not
+
+    @return boolean result, True on success, False otherwise
+    """
+    global options
+
+    (result, stdout, stderr) = run_command('{0} route change {1} nexthop via {2}'.format(options.ip, dst, via))
+    if result and flush:
+        return route_flush()
+    return result
+
+
+def route_del(dst, via, flush=False):
+    """
+    Remove a route from routing table
+
+    @param string dst, destination
+    @param string via, gateway to use to reach destination
+    @param boolean flush, wether to flush the routing cache or not
+
+    @return boolean result, True on success, False otherwise
+    """
+    global options
+
+    (result, stdout, stderr) = run_command('{0} route del {1} via {2}'.format(options.ip, dst, via))
+    if flush:
+        return route_flush()
+    return result
+
+
+def route_flush():
+    """Flush route cache. Return True if OK, False otherwise."""
+    global options
+
+    (result, stdout, stderr) = run_command('{0} route flush cache'.format(options.ip))
+    return result
+
+
+#
+# Commands
+#
+
+
+def run_command(command, environ=None, force=False):
+    """
+    Execute a command
+
+    @param string command, the command to execute
+    @param dict environ, os environment to use when executing the command
+    @param boolean force, force execution even in dry-run mode
+
+    @return list (result, stdout, stderr), result is True on success, False otherwise
+    """
+    global log, options
+
+
+    if options.dry_run and not force:
+        log.info('[DRY RUN MODE] Executing `{0}`'.format(command))
+        return (True, None, None)
+
+    log.debug('Executing `{0}`'.format(command))
+
+    process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environ)
+    process.wait()
+    if process.returncode != 0:
+        log.error('Command `{0}` failed with exit code {1}'.format(command, process.returncode))
+    stdout, stderr = process.communicate()
+    return (process.returncode == 0, stdout, stderr)
+
+
+def run_hook(gateway, event):
+    """
+    Run event hook for gateway
+
+    @param dict gateway, the gateway which triggered the event
+    @param string event, event that was triggered by the gateway
+
+    @return boolean result, True if the hook was ran successully, False otherwise
+    """
+    if event not in ('change', 'down', 'up'):
+        log.error('Invalid event {0} for gateway {1}'.format(event, gateway['address']))
+        return False
+
+    hook_cmd = gateway.get(event)
+    if hook_cmd is None:
+        log.debug('No hook for event {0} for gateway {1}'.format(event, gateway['address']))
+        return True
+
+    log.info('Triggering {0} event for gateway {address}'.format(event, **gateway))
+
+    environ = os.environ.copy()
+    environ['GFLOW_GATEWAY'] = gateway['address']
+    environ['GFLOW_REMOTES'] = ' '.join(gateway['remotes'])
+    environ['GFLOW_EVENT'] = event
+    environ['GFLOW_IFACE'] = gateway['iface']
+    environ['GFLOW_WEIGHT'] = str(gateway['weight'])
+
+    (result, stdout, stderr) = run_command(hook_cmd, environ=environ)
+    return result
+
+
+def main(argv=None):
+    """ The job is done here """
+    global gateways, log, options
+
+    if argv is None:
+        argv = sys.argv[1:]
+
+    opt_parser = OptionParser(u'usage: %prog [options] config_filepath')
+
+    opt_parser.add_option('-d', '--debug',
+        action='store_true',
+        help=u'Show debug messages'
+    )
+
+    opt_parser.add_option('-t', '--dry-run',
+        action='store_true',
+        help=u'Test mode'
+    )
+
+    opt_parser.add_option('-f', '--fping',
+        dest='fping',
+        help=u'Path of fping command'
+    )
+
+    opt_parser.add_option('-i', '--ip-cmd',
+        dest='ip',
+        help=u'Path of ip command'
+    )
+
+    opt_parser.add_option('', '--enable-multipath',
+        action='store_true',
+        help=u'Enable multipath route setup'
+    )
+
+    opt_parser.add_option('', '--disable-multipath',
+        action='store_true',
+        help=u'Disable multipath route setup'
+    )
+
+    opt_parser.add_option('-s', '--scan',
+        help=u'Scan gateway prefixes (use "all" to scan all gateways)'
+    )
+    opt_parser.add_option('-l', '--list',
+        action='store_true',
+        help=u'List current configuration'
+    )
+
+    options, arguments = opt_parser.parse_args(argv)
+    if len(arguments) != 1:
+        config_filepath = "/etc/gflow.ini"
+    else:
+        # Getting configuration file from command
+        config_filepath = os.path.abspath(arguments[0])
+
+    # Checking access on configuration file
+    if not os.path.isfile(config_filepath) or not os.access(config_filepath, os.R_OK):
+        opt_parser.error('Invalid configuration file %s' % config_filepath)
+
+    # Read configuration file
+    defaults = dict(here=os.path.dirname(config_filepath))
+    cfg_parser = ConfigParser(defaults=defaults)
+    cfg_parser.read(config_filepath)
+
+    # Logging initialization
+    if cfg_parser.has_section('loggers'):
+        fileConfig(config_filepath)
+
+    log = logging.getLogger()
+    if options.debug:
+        log.setLevel(logging.DEBUG)
+
+    # Add exception filter
+    log.addFilter(ExceptionFilter())
+
+    # Check configured parameter in configuration
+    try:
+        configured = cfg_parser.getboolean('global', 'configured')
+    except:
+        # Default value
+        configured = False
+
+    if not configured:
+        opt_parser.error(u'Please configure gflow before running it.\n\nThen, change the "configured" option from "global" section to "yes" (in {0}).'.format(config_filepath))
+
+    if options.ip is None:
+        try:
+            options.ip = cfg_parser.get('global', 'ip')
+        except:
+            # Default value
+            options.ip = 'ip'
+
+    if options.fping is None:
+        try:
+            options.fping = cfg_parser.get('global', 'fping')
+        except:
+            # Default value
+            options.ip = 'fping'
+
+    if options.disable_multipath and options.enable_multipath:
+        opt_parser.error(u'--disable-multipath and --enable-multipath options are exclusive')
+    elif options.disable_multipath:
+        options.multipath = False
+    elif options.enable_multipath:
+        options.multipath = True
+    else:
+        try:
+            options.multipath = cfg_parser.getboolean('global', 'multipath')
+        except:
+            # Default value
+            options.multipath = False
+
+    try:
+        options.cache_file = cfg_parser.get('global', 'cache_file')
+    except:
+        opt_parser.error(u'Missing cache_file parameter in configuration file')
+
+    # Load gateways from cache file
+    if not cache_load(options.cache_file):
+        return False
+
+    ids = [gateway['id'] for gateway in gateways]
+
+    stamp = time.time()
+
+    # Load gateways parameters from config file
+    for section in cfg_parser.sections():
+        if section.startswith('gateway:'):
+            try:
+                _id = int(section[8:])
+            except:
+                log.error('Invalid id for gateway "{0}", exiting.'.format(section))
+                return False
+
+            if _id in ids:
+                gateway = gateways[ids.index(_id)]
+            else:
+                # New gateway
+                gateway = dict(id=_id)
+                log.info('Adding new monitored gateway #{id}...'.format(**gateway))
+
+                ids.append(gateway['id'])
+                gateways.append(gateway)
+
+            cfg_options = cfg_parser.options(section)
+            if 'address' in cfg_options:
+                gateway['address'] = cfg_parser.get(section, 'address')
+
+            elif 'iface' in cfg_options:
+                gateway['iface'] = cfg_parser.get(section, 'iface')
+                if not load_peer(gateway):
+                    log.error('Failed to get peer for gateway #{id}, tunnel is probably down.'.format(**gateway))
+            else:
+                log.error('Missing `address` or `iface` parameter for gateway #{id}, exiting.'.format(**gateway))
+                return False
+
+            gateway['stamp'] = stamp
+
+            try:
+                gateway['reachable'] = cfg_parser.getboolean(section, 'reachable')
+            except:
+                gateway['reachable'] = True
+
+            try:
+                gateway['remotes'] = cfg_parser.get(section, 'remotes').split()
+            except:
+                gateway['remotes'] = []
+
+            gateway['total'] = len(gateway['remotes']) + 1
+
+            try:
+                gateway['score'] = cfg_parser.getint(section, 'score')
+            except:
+                gateway['score'] = gateway['total']
+
+            try:
+                gateway['weight'] = cfg_parser.getint(section, 'weight')
+            except:
+                gateway['weight'] = 1
+
+            for event in ('change', 'down', 'up'):
+                if cfg_parser.has_option(section, event):
+                    gateway[event] = cfg_parser.get(section, event)
+
+    if len(gateways) == 0:
+        log.error('No gateway set. Exiting.')
+        return False
+
+    # Removing old gateways
+    new_gateways = []
+    for gateway in gateways:
+        if gateway.get('stamp') != stamp:
+            log.info('Removing old gateway {address}...'.format(**gateway))
+            continue
+        new_gateways.append(gateway)
+
+    gateways = new_gateways
+
+    gateways.sort(key=lambda gateway: gateway['id'])
+
+    # Here we go!
+    alive_count = 0
+    for gateway in gateways:
+        gateway['is_default'] = False
+
+        load_active_prefixes(gateway)
+        check_gateway(gateway)
+
+        if gateway['is_alive']:
+            alive_count += 1
+
+    default_count = load_default_routes()
+
+    result = True
+    if alive_count == 0:
+        log.error('No gateway is alive, this is usually bad.')
+        result = False
+
+    elif options.scan or options.list:
+        print('Gateways list:')
+        for gateway in gateways:
+            if options.list or options.scan == 'all' or options.scan == gateway['address']:
+                print('\n** Gateway #{id} **'.format(**gateway))
+                if 'address' in gateway:
+                    print(' address: {0}'.format(gateway['address']))
+                if gateway['remotes']:
+                    print(' remotes:')
+                    for remote in gateway['remotes']:
+                        print('   {0}'.format(remote))
+                print(' reachable: {0}'.format('yes' if gateway['reachable'] else 'no'))
+                print(' weight: {weight}'.format(**gateway))
+                print(' default: {0}'.format('yes' if gateway['is_default'] else 'no'))
+                print(' alive: {0}'.format('yes' if gateway['is_alive'] else 'no'))
+                print(' active: {0}'.format('yes' if gateway['is_active'] else 'no'))
+                if gateway['prefixes']:
+                    print(' prefixes:')
+                    for prefix in gateway['prefixes']:
+                        print('   {0}'.format(prefix))
+                if gateway['active_prefixes']:
+                    print(' active prefixes:')
+                    for prefix in gateway['active_prefixes']:
+                        print('   {0}'.format(prefix))
+    else:
+        for gateway in gateways:
+            if gateway['is_alive']:
+                # Activate gateways that are alive but inactive
+                if not gateway['is_active']:
+                    log.info('Activating alive gateway {address}...'.format(**gateway))
+                    for prefix in gateway['prefixes']:
+                        if prefix not in gateway['active_prefixes']:
+                            if route_add(prefix, gateway['address']):
+                                log.info('  added missing prefix {0}'.format(prefix))
+                                gateway['active_prefixes'].append(prefix)
+                            else:
+                                log.error('  failed to add missing prefix {0}'.format(prefix))
+                                result = False
+
+                gateway['active_prefixes'].sort()
+
+            elif gateway['active_prefixes']:
+                log.info('Deactivating dead gateway {address}...'.format(**gateway))
+                for prefix in gateway['active_prefixes'][:]:
+                    if route_del(prefix, gateway['address']):
+                        log.info('  removed active prefix {0}'.format(prefix))
+                        gateway['active_prefixes'].remove(prefix)
+                    else:
+                        log.error('  failed to remove active prefix {0}'.format(prefix))
+                        result = False
+
+        # Default route setup
+        need_change = False
+        if options.multipath:
+            # Using all alive gateways as default route
+            msg = []
+            via = []
+            for gateway in gateways:
+                if gateway['is_alive']:
+                    msg.append('{address} ({weight})'.format(**gateway))
+                    via.append('{address} weight {weight}'.format(**gateway))
+                    if not gateway['is_default']:
+                        need_change = True
+                elif gateway['is_default']:
+                    need_change = True
+
+            msg = ', '.join(msg)
+            via = ' nexthop via '.join(via)
+
+        else:
+            # Using first alive gateway as default route
+            msg = ''
+            via = ''
+            for gateway in gateways:
+                if gateway['is_alive']:
+                    msg = gateway['address']
+                    via = gateway['address']
+                    if not gateway['is_default'] or default_count > 1:
+                        need_change = True
+                    break
+
+        if need_change:
+            if default_count:
+                if route_change('default', via):
+                    log.info('Successfully changed default route using gateway(s) {0}'.format(msg))
+                else:
+                    log.error('Failed to change default route using gateway(s) {0}'.format(msg))
+                    result = False
+            else:
+                if route_add('default', via):
+                    log.info('Successfully added default route using gateway(s) {0}'.format(msg))
+                else:
+                    log.error('Failed to add default route using gateway(s) {0}'.format(msg))
+                    result = False
+
+    if not options.dry_run:
+        cache_save(options.cache_file)
+
+    route_flush()
+    return result
+
+
+if __name__ == '__main__':
+    sys.exit(not main())

@@ -1,0 +1,23 @@
+---
+- name: Remove common needed packages
+  become: yes
+  tags: gflow
+  apt:
+      name: fping
+      state: absent
+
+- name: Remove gflow
+  become: yes
+  tags: gflow
+  file:
+      path: "{{item}}"
+      state: absent
+  with_items:
+    - /etc/cron.d/gflow
+    - /usr/local/sbin/gflow
+    - /usr/share/doc/gflow
+    - /usr/share/man/man1/gflow.1
+    - /usr/share/man/fr/man1/gflow.fr.1
+    - /etc/logrotate.d/gflow
+    - /var/tmp/gflow.json
+    - /etc/gflow.ini

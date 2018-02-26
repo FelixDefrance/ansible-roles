@@ -1,0 +1,21 @@
+---
+- name: Check gflow is not initialized
+  tags: gflow
+  shell: stat /var/tmp/gflow.json
+  register: gflow_cache_file_present
+  failed_when: no
+  changed_when: no
+
+- name: Setup cron daemon
+  become: yes
+  tags: gflow
+  cron:
+      name: Gflow Cron
+      cron_file: gflow
+      weekday: "*"
+      minute: "*"
+      hour: "*"
+      user: root
+      job: /usr/local/sbin/gflow
+      disabled: yes
+  when: gflow_cache_file_present|failed

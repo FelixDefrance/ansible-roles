@@ -1,0 +1,74 @@
+---
+- name: Install common needed packages
+  become: yes
+  tags: gflow
+  apt:
+      name: "{{item}}"
+      state: present
+      update_cache: yes
+      cache_valid_time: 86400
+      install_recommends: no
+  with_items:
+      - fping
+      - iproute
+
+- name: Install gflow
+  become: yes
+  tags: gflow
+  copy:
+      src: gflow
+      dest: /usr/local/sbin
+      mode: 0700
+      owner: root
+      group: root
+
+- name: Check documentation environment
+  become: yes
+  tags: gflow
+  file:
+      path: /usr/share/doc/gflow
+      state: directory
+      mode: 0755
+      owner: root
+      group: root
+
+- name: Push gflow documentation
+  become: yes
+  tags: gflow
+  copy:
+      src: doc/
+      directory_mode: yes
+      dest: /usr/share/doc/gflow
+      mode: 0644
+      owner: root
+      group: root
+
+- name: Setup gflow manual in system man files
+  become: yes
+  tags: gflow
+  copy:
+      src: man/gflow.1
+      dest: /usr/share/man/man1/
+      mode: 0644
+      owner: root
+      group: root
+
+- name: Setup gflow french manual in system man files
+  become: yes
+  tags: gflow
+  copy:
+      src: man/gflow.fr.1
+      dest: /usr/share/man/fr/man1/
+      mode: 0644
+      owner: root
+      group: root
+
+- name: Manage gflow logs with logrotate
+  become: yes
+  tags: gflow
+  copy:
+      src: gflow.logrotate
+      dest: /etc/logrotate.d/gflow
+      mode: 0644
+      owner: root
+      group: root

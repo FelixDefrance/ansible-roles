@@ -1,0 +1,139 @@
+.TH GFLOW 1
+.SH NAME
+gflow \- script for managing multiple gateways on a router.
+.SH SYNOPSIS
+.B gflow
+[\fIoption\fR]
+.SH DESCRIPTION
+
+Gflow is a gateway failover. It manage the routing table when a gateway is unavailable. It's periodically launching by a cron, check if all the gateway in the configuration file are alive (responding to ping and transfer ping to remote).
+
+If the multipath option value is unset or disable  only the first of all available gateway(s) (using the id of the gateway in the configuration file (cf configuration file section id)) is(are) used as default gateway. If the gateway or remote don't respond to ping (cf score section) the alive gategay with the smaller id in the configuration file is used as default gateway. The existing route on dead gateways are removed and the traffic for those route use the default gateway. They will be added when the linked gateway for those route will be back.
+
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+show this help message and exit.
+.TP
+.BR \-d ", " \-\-debug
+Show debug messages.
+.TP
+.BR \-t ", " \-\-dry-run
+Test mode, (temporary route for fping and fping are done) but route are not managed by gflow.
+.TP
+.BR \-f " "\fIFPING_PATH\fR ", " \-\-fping=\fIFPING_PATH\fR
+Set the path of the fping command.
+.TP
+.BR \-i " "\fIIP\fR ", " \-\-ip\-cmd=\fIIP\fR
+Set the path of the ip command.
+.TP
+.BR \-\-enable\-multipath
+Enable multipath route setup
+.TP
+.BR \-\-disable\-multipath
+Disable multipath route setup
+.TP
+.BR \-s " "\fISCAN\fR ", " \-\-scan=\fISCAN\fR
+Scan and refresh gateway prefixes (use "all" to scan all gateways) or gateway ip to scan specific gateway. Useful to update gflow cache file when route are manually set or delete.
+.TP
+.BR \-l ", " \-\-list
+Most current configuration
+.SH CONFIGURATION FILE
+.SS [Global Section]
+.TP
+.BR ip
+path of the ip \fIcommand\fR which is used to manage routing table. Default: ip.
+.TP
+.BR fping
+path of the fping \fIcommand\fR which is used to check IP addresses. Default: fping.
+.TP
+.BR multipath
+whether to use the first (smallest id) or all available gateway(s) as default one(s). Default: no.
+.TP
+.BR cache_file
+file path where gflow is storing current states of configured gateways to be able to detect flips. Default: /var/tmp/gflow.json
+.TP
+.BR configured
+Let this variable to no until the configuration file is \fIproperly setup\fR, preventing doing bad things to the default reoute. Default: no.
+.TP
+.BR example
+.EX
+[global]
+ip = /bin/ip
+fping = /usr/bin/fping
+multipath = no
+cache_file = /var/tmp/gflow.json
+configured = yes
+.SS [Gateway Configuration]
+.TP
+.BR [GATEWAY:XXX]
+XXX is the id (integer) of the gateway. Unique identifier to store/retrieve gateway state to/from cache file.
+.TP
+.BR address
+The address of the gateway if available. Let this field empty in case of PtP connection. Default: empty.
+.TP
+.BR iface
+Interface of PtP connection. Address of gateway will be guessed from routing table.
+.TP
+.BR reachable
+Set to no if the gateway is not pingable, test is then skipped and successful. Default: yes.
+.TP
+.BR remotes
+One or more (space separated) IP address(es) which is(are) usually pingable via this gateway. Default: empty.
+.TP
+.BR score
+Score to get to consider a gateway as alive. A gateway reachable (or with the reacheable option at "no") count for 1 point, every reachable remote count for 1 point. The sum must be equal to the define score to consider a gateway as alive. If not gateway are consider as dead. default : empty (all remote and gateway (if gateway is set as reachable) muste be reachable)
+.TP
+.BR weight
+Weight of the route if multipath option is enabled. Refer to ip-route manual for details.
+.TP
+.BR up
+A script to run when the gateway is going up.
+.TP
+.BR down
+A script to run when the gateway is going down.
+.TP
+.BR change
+A script to run when the gateway state is changing.
+.TP
+.BR Example
+.EX
+[gateway:1]
+address = 192.168.0.1
+remotes = 80.67.169.12 80.67.169.40
+weight = 2
+;up = echo "gateway ${GFLOW_GATEWAY} is up"
+;down = echo "gateway ${GFLOW_GATEWAY} is down"
+;change = echo "gateway ${GFLOW_GATEWAY} event : ${GFLOW_EVENT}"
+[gateway:2]
+weight = 1
+address = 10.0.0.1
+remotes = 80.67.169.12 80.67.169.40
+;up = echo "gateway ${GFLOW_GATEWAY} is up"
+;down = echo "gateway ${GFLOW_GATEWAY} is down"
+;change = echo "gateway ${GFLOW_GATEWAY} event : ${GFLOW_EVENT}"
+.SH NOTES
+.TP
+For each remote, a route is added via the gateway before sending an ICMP request to the remote. This route is then removed.
+.TP
+Don't setup the default route in scripts, this is already done by gflow.
+.TP
+If you set or remove some route manually do a gflow --scan all or --scan=GATEWAY_IP_OF_ROUTE to update the cache file and make gflow take this change
+.TP
+The following variables are available in script's environment: GFLOW_GATEWAY, GFLOW_REMOTES, GFLOW_EVENT, GFLOW_IFACE, GFLOW_WEIGHT
+.SH LICENSE
+.EX
+glfow is licensed under the GNU general public license, version 2.
+.SH AUTHOR
+.EX
+Copyright (c) 2009 Julien Danjou <jdanjou@easter-eggs.com>.
+Copyright (c) 2014 Cyril Lacoux <clacoux@easter-eggs.com>, Félix Defrance <fdefrance@easter-eggs.com>.
+Copyright (c) 2016 Cyril Lacoux <clacoux@easter-eggs.com>, Julien Climent <jcliment@easter-eggs.com>.
+Copyright (c) 2018 Félix Defrance <gflow@d2france.fr>.
+.SH SOURCES
+.EX
+https://framagit.org/fdef/ansible-roles.git
+https://gitlab.easter-eggs.com/ee/gflow
+.SH SEE ALSO
+.EX
+/usr/share/doc/gflow

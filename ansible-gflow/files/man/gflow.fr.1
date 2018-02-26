@@ -1,0 +1,140 @@
+.TH GFLOW 1
+.SH NOM
+gflow \- script de gestion de plusieurs gateways sur un routeur.
+.SH SYNOPSIS
+.B gflow
+[\fIoption\fR]
+.SH DESCRIPTION
+
+Gflow est un failover de gateways qui est en charge de la gestion des routes lors de l'indisponibilité d'une gateway. Il est lancé periodiquement par un cron. Il verifie que les gateways présentes dans le fichier de configuration répondent et communiquent bien vers l'exterieur (via la commande fping).
+
+Par défaut (cad avec l'option multipath en inactive) gflow utilise la gateway disponible ("en vie") dans le fichier de configuration avec l'id le plus petit et en fait la gateway par défaut du routeur. Si la gateway ne repond plus et/ou ne communique plus avec l'extérieur (voir score) la gateway vivante avec le plus petit id dans le fichier de configuration est utilisée. Les routes existantes sur des gateways "mortes" sont enlevées et le trafic de ces routes passe par la route par défaut. Elles seront remises aussitôt que la gateway liée à ces routes sera de nouveau disponible.
+
+
+.SH OPTIONS
+.TP
+.BR \-h ", " \-\-help
+Affiche les options disponibles et quitte.
+.TP
+.BR \-d ", " \-\-debug
+Affiche les messages de debug.
+.TP
+.BR \-t ", " \-\-dry-run
+Mode test, la mise en place des routes temporaires pour les fpings et les fpings sont réellement effectuée en dehors de cela les routes exitantes et gateways ne sont pas géré par gflow.
+.TP
+.BR \-f " "\fIFPING_PATH\fR ", " \-\-fping=\fIFPING_PATH\fR
+Fixe le chemin de la commande fping
+.TP
+.BR \-i " "\fIIP\fR ", " \-\-ip\-cmd=\fIIP\fR
+Fixe le chemin de la commande ip.
+.TP
+.BR \-\-enable\-multipath
+Active le mode de routage multipath
+.TP
+.BR \-\-disable\-multipath
+Desactive le mode de routage multipath
+.TP
+.BR \-s " "\fISCAN\fR ", " \-\-scan=\fISCAN\fR
+Scan et met à jour les routes existantes (où "prefixes"). Utiliser "all" pour l'effectuer sur toutes les gateways ou mettre l'ip de la gateway cible pour l'effectuer sur une gateway précise. À utiliser pour mettre à jour le fichier de cache de gflow quand une route a été mise ou supprimée manuellement.
+.TP
+.BR \-l ", " \-\-list
+Affiche la configuration actuelle
+.SH FICHIER DE CONFIGURATION
+.SS [Global Section]
+.TP
+.BR ip
+Chemin de la \fIcommande\fR ip utilisée pour gérer les tables de routages. Défaut: ip.
+.TP
+.BR fping
+Chemin de la \fIcommande\fR fping utilisée pour verifier les adresses IP. Défaut: fping.
+.TP
+.BR multipath
+Utilise la gateway disponible avec le plus petit id si "no". Sinon utilise toutes les gateways comme gateway par defaut. Defaut: no
+.TP
+.BR cache_file
+Chemin du fichier ou gflow stock l'etat courant des gateways configuré afin d'être capable de détecter les changements d'états. Défaut: /var/tmp/gflow.json
+.TP
+.BR configured
+Laissez cette variable à "no" jusqu'à ce que le fichier de configuration soit \fIcorrectement configuré\fR. Permet de se premunir d'erreur causé sur la route par defaut. defaut: no
+.TP
+.BR exemple
+.EX
+[global]
+ip = /bin/ip
+fping = /usr/bin/fping
+multipath = no
+cache_file = /var/tmp/gflow.json
+configured = yes
+.SS [Gateway Configuration]
+.TP
+.BR [GATEWAY:XXX]
+XXX est l'id (entier positif) de la gateway. Identifiant unique pour stocker/retrouver l'état de la gateway vers/à partir du fichier de cache.
+.TP
+.BR address
+Adresse de la gateway (si existant). Laissez ce champ vide en cas de connection PtP. Défaut: empty
+.TP
+.BR iface
+Interface de la connection PtP. L'adresse de la gateway sera deviné à partir de la table de routage.
+.TP
+.BR reachable
+Mettre à non si la gateway n'est pas pingable, dans ce cas le test est passé et considéré comme réussi. Defaut: yes
+.TP
+.BR remotes
+Une ou plusieurs adresse.s IP (séparées par des espaces) habituellement pingable via les gateways. Défaut: empty
+.TP
+.BR score
+Score à obtenir pour qu'une gateway soit considérée comme vivante. Une gateway repondant au ping (ou avec l'option reachable=no) compte pour 1 et chaque remote repondant au ping compte pour 1. La somme de ces points doit être égal au score pour qu'une gateway soit considérée en vie. Sinon elle est considérée comme morte. défaut : empty (tout les remotes et la gateway (si reachable doivent répondre))
+.TP
+.BR weight
+Poids de la route quand l'option multipath est activée. Se référer à page de man de ip-route pour plus de détail.
+.TP
+.BR up
+Script ou commande à executer quand la gateway revient.
+.TP
+.BR down
+Script ou commande à executer quand la gateway est morte.
+.TP
+.BR change
+Script ou commande à executer quand la gateway change d'état.
+.TP
+.BR Example
+.EX
+[gateway:1]
+address = 192.168.0.1
+remotes = 213.188.170.58 37.9.136.135
+weight = 2
+;up = echo "gateway ${GFLOW_GATEWAY} is up"
+;down = echo "gateway ${GFLOW_GATEWAY} is down"
+;change = echo "gateway ${GFLOW_GATEWAY} event : ${GFLOW_EVENT}"
+[gateway:2]
+weight = 1
+address = 10.0.0.1
+remotes = 213.188.170.58 37.9.136.135
+;up = echo "gateway ${GFLOW_GATEWAY} is up"
+;down = echo "gateway ${GFLOW_GATEWAY} is down"
+;change = echo "gateway ${GFLOW_GATEWAY} event : ${GFLOW_EVENT}"
+.SH NOTES
+.TP
+Pour chaque remote, une route est ajouté via la gateway testé avant d'envoyer une requête ICMP au remote. Cette routes est ensuite enlevé.
+.TP
+Ne mettez pas de route par défaut dans des scripts, cela est déjà fait par gflow.
+.TP
+Si vous mettez ou enlevez des routes manuellement faite un "gflow --scan=IP_DE_LA_GATEWAY" ou un "gflow --scan all" pour mettre à jour le fichier de cache et afin que gflow prennent en considération ce changement.
+.TP
+Les variables suivantes sont utilisables dans l'environnement du script : GFLOW_GATEWAY, GFLOW_REMOTES, GFLOW_EVENT, GFLOW_IFACE, GFLOW_WEIGHT
+.SH LICENSE
+.EX
+glfow est sous licence GPLv2.
+.SH AUTHOR
+.EX
+Copyright (c) 2009 Julien Danjou <jdanjou@easter-eggs.com>.
+Copyright (c) 2014 Cyril Lacoux <clacoux@easter-eggs.com>, Félix Defrance <fdefrance@easter-eggs.com>.
+Copyright (c) 2016 Cyril Lacoux <clacoux@easter-eggs.com>, Julien Climent <jcliment@easter-eggs.com>.
+Copyright (c) 2018 Félix Defrance <gflow@d2france.fr>.
+.SH SOURCES
+.EX
+https://framagit.org/fdef/ansible-roles.git
+https://gitlab.easter-eggs.com/ee/gflow
+.SH SEE ALSO
+.EX
+/usr/share/doc/gflow

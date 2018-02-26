@@ -1,0 +1,20 @@
+---
+- name: Assert platform is debian
+  assert:
+    that:
+      - ansible_os_family in ['Debian']
+
+# Install gflow
+- include: install.yml
+  when: gflow_remove == False
+
+# Install gflow for your specific setup
+- include: install-specific.yml
+  when: gflow_remove == False
+
+# Install cron file when gflow is not initialized
+- include: cron.yml
+
+# Remove gflow
+- include: remove.yml
+  when: gflow_remove == True
